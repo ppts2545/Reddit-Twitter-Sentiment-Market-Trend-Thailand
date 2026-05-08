@@ -163,13 +163,17 @@ def fetch_market_signals(tickers: dict = MARKET_TICKERS, period='1y'):
     return result
 
 
+DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
+
 if __name__ == "__main__":
     print("=== Thailand Unemployment Rate ===")
     df = fetch_worldbank('SL.UEM.TOTL.ZS', country='TH')
+    df.write_csv(os.path.join(DATA_DIR, 'thailand_unemployment_rate.csv'))
     print(df.tail(5))
 
     print("\n=== Market Signals (1 year) ===")
     markets = fetch_market_signals(period='1y')
     for name, df in markets.items():
         print(f"\n{name}:")
+        df.write_csv(os.path.join(DATA_DIR, f'{name}_market_signals.csv'))
         print(df.tail(3))
