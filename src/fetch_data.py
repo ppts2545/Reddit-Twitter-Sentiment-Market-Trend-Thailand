@@ -1,69 +1,175 @@
-import praw
 import os
+import time
+import random
+import requests as req_lib
 import polars as pl
-import matplotlib.pyplot as plt
+import yfinance as yf
 from pytrends.request import TrendReq
 from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
-"""
-#Import Data from Reddit
-#Autehntication with Reddit API
-reddit = praw.Reddit(client_id=os.getenv('REDDIT_CLIENT_ID'),
-                        client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-                        user_agent=os.getenv('REDDIT_USER_AGENT')
-)
-# Search for Thailand market trernd keywords
-subreddit = reddit.subreddit('Thailand')
-results = []
-for submission in subreddit.search('Thailand market trend', limit=100):
-    results.append({
-        'title': submission.title,
-        'score': submission.score,
-        'num_comments': submission.num_comments,
-        'created_utc': submission.created_utc
-    })
-
-df_reddit = pl.DataFrame(results)
-print(df_reddit.head())
-"""
-# Use a real browser User-Agent
-requests_args = {
-    'headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-    }
+# Countries to compare: Thailand vs major economies
+COUNTRIES = {
+    'TH': 'Thailand',
+    'US': 'United States',
+    'CN': 'China',
+    'JP': 'Japan',
+    'DE': 'Germany',
+    'SG': 'Singapore',
 }
 
-# IMPORTANT: You must pass requests_args here
-pytrends = TrendReq(hl='en-US', tz=360, requests_args=requests_args, retries=2, backoff_factor=0.1)
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+}
 
-# 2. Define keywords and region
-kw_list = ["Thailand market trend"]
 
-try:
-    print("Connecting to Google Trends...")
-    pytrends.build_payload(kw_list, timeframe='today 12-m', geo='TH')
+# --- SECTION 1: LABOR MARKET (World Bank API) ---
+# Annual data: unemployment, youth unemployment, labor force participation
 
-    # 3. Get Interest over time
-    data = pytrends.interest_over_time()
+LABOR_INDICATORS = {
+    'unemployment_rate':        'SL.UEM.TOTL.ZS',   # % of total labor force
+    'youth_unemployment_rate':  'SL.UEM.1524.ZS',   # % of youth labor force (15-24)
+    'labor_force_participation': 'SL.TLF.CACT.ZS',  # % of working-age population
+    'employment_ratio':         'SL.EMP.TOTL.SP.ZS', # Employment-to-population ratio
+}
 
-    if not data.empty:
-        # 4. Show the top results
-        print("Recent Interest Levels (Top 5 rows):")
-        print(data.tail())
+def fetch_worldbank(indicator_code, country='TH'):
+    """
+    Fetch a World Bank indicator for one country.
+    Returns a polars DataFrame: year, value, country.
+    """
+    url = (
+        f"https://api.worldbank.org/v2/country/{country}"
+        f"/indicator/{indicator_code}?format=json&per_page=50&mrv=25"
+    )
+    resp = req_lib.get(url, headers=BROWSER_HEADERS, timeout=10)
+    resp.raise_for_status()
+    records = resp.json()[1]
+    return pl.DataFrame([
+        {'year': int(r['date']), 'value': r['value'], 'country': country}
+        for r in records if r['value'] is not None
+    ]).sort('year')
 
-        # 5. Simple Visualization
-        data.plot(figsize=(10, 6))
-        plt.title('Market Search Trends in Thailand (Last 12 Months)')
-        plt.ylabel('Search Interest')
-        plt.show()
-    else:
-        print("No data found for these keywords.")
+def fetch_labor_market(countries: dict = COUNTRIES):
+    """
+    Fetch all labor market indicators for all countries.
+    Returns a dict of {indicator_name: polars DataFrame (all countries stacked)}.
+    """
+    result = {}
+    for name, code in LABOR_INDICATORS.items():
+        frames = []
+        for iso in countries:
+            try:
+                frames.append(fetch_worldbank(code, country=iso))
+            except Exception as e:
+                print(f"[Skip] {iso} / {name}: {e}")
+        if frames:
+            result[name] = pl.concat(frames)
+    return result
 
-except Exception as e:
-    print(f"An error occurred: {e}")
-    if "429" in str(e):
-        print("STILL BLOCKED: Google is still rate-limiting your IP.")
-        print("Try: 1. Using a VPN. 2. Waiting 1 hour. 3. Applying the 'POST' fix in request.py.")
 
+# --- SECTION 2: ECONOMIC CONTEXT (World Bank API) ---
+# GDP growth, inflation, trade openness — for understanding why unemployment moves
+
+ECONOMIC_INDICATORS = {
+    'gdp_growth':      'NY.GDP.MKTP.KD.ZG',   # GDP growth rate (%)
+    'inflation':       'FP.CPI.TOTL.ZG',       # Inflation, consumer prices (%)
+    'trade_pct_gdp':   'NE.TRD.GNFS.ZS',       # Trade as % of GDP (globalization proxy)
+    'fdi_inflows':     'BX.KLT.DINV.WD.GD.ZS', # Foreign direct investment (% of GDP)
+}
+
+def fetch_economic_context(countries: dict = COUNTRIES):
+    """
+    Fetch economic context indicators for all countries.
+    Same structure as fetch_labor_market().
+    """
+    result = {}
+    for name, code in ECONOMIC_INDICATORS.items():
+        frames = []
+        for iso in countries:
+            try:
+                frames.append(fetch_worldbank(code, country=iso))
+            except Exception as e:
+                print(f"[Skip] {iso} / {name}: {e}")
+        if frames:
+            result[name] = pl.concat(frames)
+    return result
+
+
+# --- SECTION 3: JOB SEARCH TRENDS (Google Trends) ---
+# Search interest as a leading/coincident indicator for labor market sentiment.
+# High "job search" queries often correlate with rising unemployment or career pivots.
+
+JOB_KEYWORDS = {
+    'TH': ['หางาน', 'สมัครงาน', 'ว่างงาน'],
+    'global': ['unemployment', 'jobs', 'layoffs'],
+}
+
+def fetch_job_search_trends(keywords: list, geo='TH', timeframe='today 12-m', max_retries=5):
+    """
+    Fetch Google Trends interest for job-related keywords.
+    Returns a pandas DataFrame (pytrends output), or None on failure.
+    """
+    pytrends = TrendReq(hl='en-US', tz=360, requests_args={'headers': BROWSER_HEADERS})
+
+    for attempt in range(max_retries):
+        try:
+            pytrends.build_payload(keywords, timeframe=timeframe, geo=geo)
+            data = pytrends.interest_over_time()
+            if not data.empty:
+                if 'isPartial' in data.columns:
+                    data = data.drop(columns=['isPartial'])
+                return data
+        except Exception as e:
+            if "429" in str(e):
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"[Rate limited] Retry {attempt + 1}/{max_retries} in {wait:.1f}s...")
+                time.sleep(wait)
+            else:
+                print(f"[Error] {e}")
+                break
+
+    return None
+
+
+# --- SECTION 4: MARKET SIGNALS (yfinance) ---
+# Financial markets often price in economic shifts before official data is published.
+
+MARKET_TICKERS = {
+    'SET_index':  '^SET.BK',  # Thailand stock market
+    'USD_THB':    'THB=X',    # Baht strength
+    'sp500':      '^GSPC',    # US S&P 500 (global risk appetite)
+    'oil':        'CL=F',     # Crude oil (global growth proxy)
+    'gold':       'GC=F',     # Gold (risk-off / uncertainty signal)
+    'vix':        '^VIX',     # Volatility index (global fear gauge)
+}
+
+def fetch_market_signals(tickers: dict = MARKET_TICKERS, period='1y'):
+    """
+    Fetch closing price history for each market ticker.
+    Returns a dict of {name: polars DataFrame with Date and Close columns}.
+    """
+    result = {}
+    for name, symbol in tickers.items():
+        try:
+            df_pd = yf.download(symbol, period=period, progress=False, auto_adjust=True)
+            if not df_pd.empty:
+                df_pd = df_pd[['Close']].reset_index()
+                df_pd.columns = ['date', 'close']
+                result[name] = pl.from_pandas(df_pd)
+        except Exception as e:
+            print(f"[Skip] {name}: {e}")
+    return result
+
+
+if __name__ == "__main__":
+    print("=== Thailand Unemployment Rate ===")
+    df = fetch_worldbank('SL.UEM.TOTL.ZS', country='TH')
+    print(df.tail(5))
+
+    print("\n=== Market Signals (1 year) ===")
+    markets = fetch_market_signals(period='1y')
+    for name, df in markets.items():
+        print(f"\n{name}:")
+        print(df.tail(3))
