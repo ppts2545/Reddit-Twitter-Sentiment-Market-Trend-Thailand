@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Common start date for all data sources — 2003 is the earliest year
-# where ALL market tickers (including USD/THB) have data.
-DATA_START = '2003-01-01'
+# Extended start: Gold/Oil available from Aug 2000 — use 2000-01-01 so weekly
+# resampling lands cleanly; USD/THB gap (2000-2003) filled via FRED EXTHUS monthly.
+DATA_START = '2000-01-01'
 
 # Countries to compare: Thailand vs major economies
 COUNTRIES = {
@@ -357,6 +357,7 @@ if __name__ == "__main__":
             'th_us_imports':         'IMP5490',       # US imports from Thailand (factor 6)
             'th_property_prices':    'QTHR628BIS',    # Bangkok property prices (factor 1)
             'th_uncertainty':        'WUITHA',        # World uncertainty index TH (factor 7)
+            'usd_thb_monthly':       'EXTHUS',        # USD/THB monthly (fills 2000-2003 gap)
 
             # --- US/Global monthly (affects Thailand directly) ---
             # Factor 2: Interest rate
